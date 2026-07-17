@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: x-search
+    runtime: docker
+    plan: free
+    envVars:
+      - key: X_AUTH_TOKEN
+        sync: false
+      - key: X_CT0
+        sync: false
+      - key: X_AUTH_MULTI
+        sync: false
+      - key: X_TWID
+        sync: false
