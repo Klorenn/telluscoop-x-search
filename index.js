@@ -5,11 +5,12 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.X_AUTH_TOKEN;
-const CT0 = process.env.X_CT0;
-const AUTH_MULTI = process.env.X_AUTH_MULTI || "";
-const TWID = process.env.X_TWID || "";
+const AUTH_TOKEN = (process.env.X_AUTH_TOKEN || "").trim();
+const CT0 = (process.env.X_CT0 || "").trim();
+const AUTH_MULTI = (process.env.X_AUTH_MULTI || "").trim();
+const TWID = (process.env.X_TWID || "").trim();
 
+console.log("Env vars:", { AUTH_TOKEN: !!AUTH_TOKEN, CT0: !!CT0, AUTH_MULTI: !!AUTH_MULTI, TWID: !!TWID });
 if (!AUTH_TOKEN || !CT0) {
   console.error("Missing X_AUTH_TOKEN or X_CT0 env vars");
   process.exit(1);
