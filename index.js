@@ -24,7 +24,19 @@ async function getBrowser() {
   if (!browser) {
     browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        // Render free tier has 512MB/0.1CPU: strip everything non-essential
+        // or x.com's SPA never finishes booting.
+        "--disable-gpu",
+        "--disable-extensions",
+        "--mute-audio",
+        "--disable-background-networking",
+        "--renderer-process-limit=2",
+        "--js-flags=--max-old-space-size=192",
+      ],
     });
   }
   return browser;
@@ -136,6 +148,14 @@ app.post("/search", async (req, res) => {
     if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
     await context.addCookies(cookies);
 
+    // Drop heavy assets: X works fine without them and the free instance
+    // can't afford the memory.
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "image" || type === "media" || type === "font") return route.abort();
+      return route.continue();
+    });
+
     const page = await context.newPage();
 
     // Capture the SearchTimeline response via route interception. The page's
@@ -160,26 +180,15 @@ app.post("/search", async (req, res) => {
       await route.fulfill({ response });
     });
 
-    // Navigate to x.com to establish session cookies
-    console.log(`[${Date.now()}] Navigating to x.com...`);
-    await page.goto("https://x.com/home", { waitUntil: "domcontentloaded", timeout: 30000 });
-    console.log(`[${Date.now()}] Page loaded, URL: ${page.url()}`);
-
-    // Wait for Cloudflare challenge if any
-    await page.waitForTimeout(3000);
-
-    // Check if we're logged in
-    const cookiesList = await context.cookies("https://x.com");
-    const hasAuth = cookiesList.some(c => c.name === "auth_token");
-    console.log(`[${Date.now()}] Has auth cookie: ${hasAuth}`);
-
-    // Make the search request by navigating to search page
-    // This triggers the SearchTimeline GraphQL call automatically
+    // Go straight to the search page: cookies are already injected and one
+    // SPA boot is all the free instance can afford. The page itself fires
+    // the SearchTimeline GraphQL call.
     const searchPageUrl = `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query`;
     console.log(`[${Date.now()}] Navigating to search: ${searchPageUrl}`);
 
-    await page.goto(searchPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(5000);
+    await page.goto(searchPageUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // Slow CPU needs patience: poll up to 45s but bail as soon as we capture.
+    for (let i = 0; i < 90 && !capturedData; i += 1) await page.waitForTimeout(500);
 
     // If route interception didn't catch it, try direct fetch (needs a qid,
     // either provided by the client or sniffed from the page's own request)
