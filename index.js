@@ -18,28 +18,31 @@ if (!AUTH_TOKEN || !CT0) {
 
 const BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
-let browser = null;
+// 512MB instance: a persistent browser leaks until the container OOMs
+// (searches started failing after 2-3 requests). Launch fresh per search and
+// serialize requests so two browsers never coexist.
+async function launchBrowser() {
+  return chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-extensions",
+      "--mute-audio",
+      "--disable-background-networking",
+      "--renderer-process-limit=2",
+      "--js-flags=--max-old-space-size=192",
+    ],
+  });
+}
 
-async function getBrowser() {
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        // Render free tier has 512MB/0.1CPU: strip everything non-essential
-        // or x.com's SPA never finishes booting.
-        "--disable-gpu",
-        "--disable-extensions",
-        "--mute-audio",
-        "--disable-background-networking",
-        "--renderer-process-limit=2",
-        "--js-flags=--max-old-space-size=192",
-      ],
-    });
-  }
-  return browser;
+let queue = Promise.resolve();
+function enqueue(job) {
+  const run = queue.then(job, job);
+  queue = run.catch(() => {});
+  return run;
 }
 
 const SEARCH_FEATURES = {
@@ -126,15 +129,23 @@ function parseSearch(data) {
   return posts;
 }
 
-app.post("/search", async (req, res) => {
+app.post("/search", (req, res) => {
+  enqueue(() => runSearch(req, res)).catch((err) => {
+    console.error(`[${Date.now()}] Queue error:`, err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  });
+});
+
+async function runSearch(req, res) {
   const startTime = Date.now();
+  let browserInstance = null;
   try {
     const { query, count = 20, qid } = req.body;
     if (!query) return res.status(400).json({ error: "Missing query" });
 
     console.log(`[${Date.now()}] Search: "${query}" qid=${qid || "(auto)"}`);
 
-    const browserInstance = await getBrowser();
+    browserInstance = await launchBrowser();
     const context = await browserInstance.newContext({
       userAgent:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -240,8 +251,6 @@ app.post("/search", async (req, res) => {
 
     const finalUrl = page.url();
     const finalTitle = await page.title().catch(() => "");
-    await page.close();
-    await context.close();
 
     if (!capturedData) {
       // Surface where the page actually landed so a login wall or challenge
@@ -257,20 +266,15 @@ app.post("/search", async (req, res) => {
     res.json({ posts, count: posts.length });
   } catch (err) {
     console.error(`[${Date.now()}] Search error:`, err.message);
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  } finally {
+    if (browserInstance) await browserInstance.close().catch(() => {});
   }
-});
+}
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-process.on("SIGTERM", async () => {
-  if (browser) await browser.close();
-  process.exit(0);
-});
-
-process.on("SIGINT", async () => {
-  if (browser) await browser.close();
-  process.exit(0);
-});
+process.on("SIGTERM", () => process.exit(0));
+process.on("SIGINT", () => process.exit(0));
 
 app.listen(PORT, () => console.log(`X search server on :${PORT}`));
