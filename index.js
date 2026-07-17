@@ -119,23 +119,8 @@ app.post("/search", async (req, res) => {
   try {
     const { query, count = 20, qid } = req.body;
     if (!query) return res.status(400).json({ error: "Missing query" });
-    if (!qid) return res.status(400).json({ error: "Missing qid" });
 
-    console.log(`[${Date.now()}] Search: "${query}" qid=${qid}`);
-
-    const variables = {
-      rawQuery: query,
-      count: Math.min(count, 40),
-      querySource: "typed_query",
-      product: "Top",
-      withGrokTranslatedBio: true,
-      withQuickPromoteEligibilityTweetFields: false,
-    };
-
-    const searchUrl =
-      `https://x.com/i/api/graphql/${qid}/SearchTimeline` +
-      `?variables=${encodeURIComponent(JSON.stringify(variables))}` +
-      `&features=${encodeURIComponent(JSON.stringify(SEARCH_FEATURES))}`;
+    console.log(`[${Date.now()}] Search: "${query}" qid=${qid || "(auto)"}`);
 
     const browserInstance = await getBrowser();
     const context = await browserInstance.newContext({
@@ -153,12 +138,17 @@ app.post("/search", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Capture the SearchTimeline response via route interception
+    // Capture the SearchTimeline response via route interception. The page's
+    // own request also reveals the current qid, so the client never has to
+    // hunt it down manually.
     let capturedData = null;
+    let liveQid = qid || null;
     await page.route("**/api/graphql/**/SearchTimeline**", async (route) => {
+      const match = route.request().url().match(/graphql\/([^/]+)\/SearchTimeline/);
+      if (match) liveQid = match[1];
       const response = await route.fetch();
       const status = response.status();
-      console.log(`[${Date.now()}] Intercepted SearchTimeline: ${status}`);
+      console.log(`[${Date.now()}] Intercepted SearchTimeline: ${status} qid=${liveQid}`);
 
       if (status === 200) {
         try {
@@ -191,9 +181,23 @@ app.post("/search", async (req, res) => {
     await page.goto(searchPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(5000);
 
-    // If route interception didn't catch it, try direct fetch
-    if (!capturedData) {
+    // If route interception didn't catch it, try direct fetch (needs a qid,
+    // either provided by the client or sniffed from the page's own request)
+    if (!capturedData && liveQid) {
       console.log(`[${Date.now()}] Route interception missed, trying direct API call...`);
+
+      const variables = {
+        rawQuery: query,
+        count: Math.min(count, 40),
+        querySource: "typed_query",
+        product: "Top",
+        withGrokTranslatedBio: true,
+        withQuickPromoteEligibilityTweetFields: false,
+      };
+      const searchUrl =
+        `https://x.com/i/api/graphql/${liveQid}/SearchTimeline` +
+        `?variables=${encodeURIComponent(JSON.stringify(variables))}` +
+        `&features=${encodeURIComponent(JSON.stringify(SEARCH_FEATURES))}`;
 
       const result = await page.evaluate(async ({ url, bearer, csrf }) => {
         try {
@@ -225,11 +229,18 @@ app.post("/search", async (req, res) => {
       }
     }
 
+    const finalUrl = page.url();
+    const finalTitle = await page.title().catch(() => "");
     await page.close();
     await context.close();
 
     if (!capturedData) {
-      return res.status(502).json({ error: "No se pudo obtener respuesta de X" });
+      // Surface where the page actually landed so a login wall or challenge
+      // is visible from the API response (Render logs are hard to reach).
+      return res.status(502).json({
+        error: "No se pudo obtener respuesta de X",
+        diag: { url: finalUrl, title: finalTitle, qid: liveQid },
+      });
     }
 
     const posts = parseSearch(capturedData);
