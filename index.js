@@ -2,7 +2,7 @@ import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = (process.env.X_AUTH_TOKEN || "").trim();
@@ -16,13 +16,15 @@ if (!AUTH_TOKEN || !CT0) {
   process.exit(1);
 }
 
+const BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+
 let browser = null;
 
 async function getBrowser() {
   if (!browser) {
     browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
   }
   return browser;
@@ -91,8 +93,7 @@ function parseSearch(data) {
       if (!legacy || legacy.retweeted_status_result) continue;
 
       const core = result?.core?.user_results?.result;
-      const handle =
-        core?.legacy?.screen_name ?? core?.core?.screen_name ?? "";
+      const handle = core?.legacy?.screen_name ?? core?.core?.screen_name ?? "";
       if (!handle) continue;
 
       const note = result?.note_tweet?.note_tweet_results?.result;
@@ -102,9 +103,7 @@ function parseSearch(data) {
         author_handle: handle,
         url: `https://x.com/${handle}/status/${idStr}`,
         content: String(note?.text ?? legacy.full_text ?? "").trim(),
-        posted_at: legacy.created_at
-          ? new Date(legacy.created_at).toISOString()
-          : null,
+        posted_at: legacy.created_at ? new Date(legacy.created_at).toISOString() : null,
         likes: num(legacy.favorite_count),
         reposts: num(legacy.retweet_count),
         replies: num(legacy.reply_count),
@@ -116,10 +115,13 @@ function parseSearch(data) {
 }
 
 app.post("/search", async (req, res) => {
+  const startTime = Date.now();
   try {
     const { query, count = 20, qid } = req.body;
     if (!query) return res.status(400).json({ error: "Missing query" });
     if (!qid) return res.status(400).json({ error: "Missing qid" });
+
+    console.log(`[${Date.now()}] Search: "${query}" qid=${qid}`);
 
     const variables = {
       rawQuery: query,
@@ -130,7 +132,7 @@ app.post("/search", async (req, res) => {
       withQuickPromoteEligibilityTweetFields: false,
     };
 
-    const url =
+    const searchUrl =
       `https://x.com/i/api/graphql/${qid}/SearchTimeline` +
       `?variables=${encodeURIComponent(JSON.stringify(variables))}` +
       `&features=${encodeURIComponent(JSON.stringify(SEARCH_FEATURES))}`;
@@ -141,7 +143,6 @@ app.post("/search", async (req, res) => {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     });
 
-    // Set cookies
     const cookies = [
       { name: "auth_token", value: AUTH_TOKEN, domain: ".x.com", path: "/" },
       { name: "ct0", value: CT0, domain: ".x.com", path: "/" },
@@ -152,59 +153,102 @@ app.post("/search", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Intercept the GraphQL response
-    let responseData = null;
-    page.on("response", async (response) => {
-      if (response.url().includes("SearchTimeline")) {
+    // Capture the SearchTimeline response via route interception
+    let capturedData = null;
+    await page.route("**/api/graphql/**/SearchTimeline**", async (route) => {
+      const response = await route.fetch();
+      const status = response.status();
+      console.log(`[${Date.now()}] Intercepted SearchTimeline: ${status}`);
+
+      if (status === 200) {
         try {
-          responseData = await response.json();
-        } catch {}
+          capturedData = await response.json();
+        } catch (e) {
+          console.error("Failed to parse response:", e.message);
+        }
       }
+      await route.fulfill({ response });
     });
 
-    // Navigate to x.com to establish session, then make the API call
-    await page.goto("https://x.com/home", { waitUntil: "domcontentloaded", timeout: 15000 });
-    await page.waitForTimeout(2000);
+    // Navigate to x.com to establish session cookies
+    console.log(`[${Date.now()}] Navigating to x.com...`);
+    await page.goto("https://x.com/home", { waitUntil: "domcontentloaded", timeout: 30000 });
+    console.log(`[${Date.now()}] Page loaded, URL: ${page.url()}`);
 
-    // Make the API call via fetch in the page context
-    const BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
-    
-    const apiResult = await page.evaluate(async ({ url, bearer, csrf }) => {
-      const resp = await fetch(url, {
-        headers: {
-          authorization: bearer,
-          "x-csrf-token": csrf,
-          "x-twitter-active-user": "yes",
-          "x-twitter-auth-type": "OAuth2Session",
-          "content-type": "application/json",
-        },
-        credentials: "include",
-      });
-      return { status: resp.status, body: await resp.json() };
-    }, { url, bearer: BEARER, csrf: CT0 });
+    // Wait for Cloudflare challenge if any
+    await page.waitForTimeout(3000);
+
+    // Check if we're logged in
+    const cookiesList = await context.cookies("https://x.com");
+    const hasAuth = cookiesList.some(c => c.name === "auth_token");
+    console.log(`[${Date.now()}] Has auth cookie: ${hasAuth}`);
+
+    // Make the search request by navigating to search page
+    // This triggers the SearchTimeline GraphQL call automatically
+    const searchPageUrl = `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query`;
+    console.log(`[${Date.now()}] Navigating to search: ${searchPageUrl}`);
+
+    await page.goto(searchPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(5000);
+
+    // If route interception didn't catch it, try direct fetch
+    if (!capturedData) {
+      console.log(`[${Date.now()}] Route interception missed, trying direct API call...`);
+
+      const result = await page.evaluate(async ({ url, bearer, csrf }) => {
+        try {
+          const resp = await fetch(url, {
+            headers: {
+              authorization: bearer,
+              "x-csrf-token": csrf,
+              "x-twitter-active-user": "yes",
+              "x-twitter-auth-type": "OAuth2Session",
+              "content-type": "application/json",
+            },
+            credentials: "include",
+          });
+          const text = await resp.text();
+          return { status: resp.status, body: text };
+        } catch (e) {
+          return { status: 0, body: e.message };
+        }
+      }, { url: searchUrl, bearer: BEARER, csrf: CT0 });
+
+      console.log(`[${Date.now()}] Direct API result: ${result.status}, body length: ${result.body.length}`);
+
+      if (result.status === 200 && result.body) {
+        try {
+          capturedData = JSON.parse(result.body);
+        } catch (e) {
+          console.error("Failed to parse direct API response:", e.message);
+        }
+      }
+    }
 
     await page.close();
     await context.close();
 
-    if (apiResult.status === 404) {
-      return res.status(400).json({ error: "Query ID vencido — actualizá el QID" });
-    }
-    if (apiResult.status !== 200) {
-      return res.status(502).json({ error: `X respondió ${apiResult.status}` });
+    if (!capturedData) {
+      return res.status(502).json({ error: "No se pudo obtener respuesta de X" });
     }
 
-    const posts = parseSearch(apiResult.body);
+    const posts = parseSearch(capturedData);
+    console.log(`[${Date.now()}] Found ${posts.length} posts in ${Date.now() - startTime}ms`);
     res.json({ posts, count: posts.length });
   } catch (err) {
-    console.error("Search error:", err);
+    console.error(`[${Date.now()}] Search error:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Graceful shutdown
 process.on("SIGTERM", async () => {
+  if (browser) await browser.close();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
   if (browser) await browser.close();
   process.exit(0);
 });
