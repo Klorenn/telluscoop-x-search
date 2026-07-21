@@ -136,6 +136,13 @@ app.post("/search", (req, res) => {
   });
 });
 
+app.post("/profile", (req, res) => {
+  enqueue(() => runProfile(req, res)).catch((err) => {
+    console.error(`[${Date.now()}] Queue error:`, err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  });
+});
+
 async function runSearch(req, res) {
   const startTime = Date.now();
   let browserInstance = null;
@@ -266,6 +273,113 @@ async function runSearch(req, res) {
     res.json({ posts, count: posts.length });
   } catch (err) {
     console.error(`[${Date.now()}] Search error:`, err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  } finally {
+    if (browserInstance) await browserInstance.close().catch(() => {});
+  }
+}
+
+function parseFollowers(data) {
+  const result = data?.data?.user?.result;
+  const legacy = result?.legacy ?? result?.core?.legacy;
+  const n = num(legacy?.followers_count ?? result?.relationship_counts?.followers);
+  return n || null;
+}
+
+function parseLatestTweet(data, handle) {
+  const instructions =
+    data?.data?.user?.result?.timeline_v2?.timeline?.instructions ??
+    data?.data?.user?.result?.timeline?.timeline?.instructions ?? [];
+
+  let latest = null;
+  for (const instruction of instructions) {
+    for (const entry of instruction.entries ?? []) {
+      if (!String(entry.entryId ?? "").startsWith("tweet-")) continue;
+
+      let result = entry.content?.itemContent?.tweet_results?.result;
+      if (!result) continue;
+      if (result.__typename === "TweetWithVisibilityResults") result = result.tweet;
+      const legacy = result?.legacy;
+      if (!legacy || legacy.retweeted_status_result) continue;
+
+      const idStr = String(legacy.id_str ?? "");
+      const postedAt = legacy.created_at ? new Date(legacy.created_at).toISOString() : null;
+      if (!postedAt || !idStr) continue;
+      if (!latest || postedAt > latest.posted_at) {
+        latest = { url: `https://x.com/${handle}/status/${idStr}`, posted_at: postedAt };
+      }
+    }
+  }
+  return latest;
+}
+
+async function runProfile(req, res) {
+  const startTime = Date.now();
+  let browserInstance = null;
+  try {
+    const handle = String(req.body?.handle || "").replace(/^@/, "").trim();
+    if (!handle) return res.status(400).json({ error: "Missing handle" });
+
+    console.log(`[${Date.now()}] Profile: @${handle}`);
+
+    browserInstance = await launchBrowser();
+    const context = await browserInstance.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    });
+
+    const cookies = [
+      { name: "auth_token", value: AUTH_TOKEN, domain: ".x.com", path: "/" },
+      { name: "ct0", value: CT0, domain: ".x.com", path: "/" },
+    ];
+    if (TWID) cookies.push({ name: "twid", value: TWID, domain: ".x.com", path: "/" });
+    if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
+    await context.addCookies(cookies);
+
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "image" || type === "media" || type === "font") return route.abort();
+      return route.continue();
+    });
+
+    const page = await context.newPage();
+
+    // The profile page fires both UserByScreenName (header, has followers_count)
+    // and UserTweets (timeline) on load; intercept both.
+    let followers = null;
+    let latestTweet = null;
+    await page.route("**/api/graphql/**/UserByScreenName**", async (route) => {
+      const response = await route.fetch();
+      if (response.status() === 200) {
+        try { followers = parseFollowers(await response.json()); } catch { /* ignore */ }
+      }
+      await route.fulfill({ response });
+    });
+    await page.route("**/api/graphql/**/UserTweets**", async (route) => {
+      const response = await route.fetch();
+      if (response.status() === 200) {
+        try { latestTweet = parseLatestTweet(await response.json(), handle); } catch { /* ignore */ }
+      }
+      await route.fulfill({ response });
+    });
+
+    await page.goto(`https://x.com/${handle}`, { waitUntil: "domcontentloaded", timeout: 60000 });
+    for (let i = 0; i < 90 && (followers === null || latestTweet === null); i += 1) await page.waitForTimeout(500);
+
+    const finalUrl = page.url();
+    const finalTitle = await page.title().catch(() => "");
+
+    if (followers === null && latestTweet === null) {
+      return res.status(502).json({
+        error: "No se pudo obtener el perfil de X",
+        diag: { url: finalUrl, title: finalTitle },
+      });
+    }
+
+    console.log(`[${Date.now()}] Profile @${handle}: followers=${followers} latest=${latestTweet?.posted_at} in ${Date.now() - startTime}ms`);
+    res.json({ followers, latest_post: latestTweet });
+  } catch (err) {
+    console.error(`[${Date.now()}] Profile error:`, err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
   } finally {
     if (browserInstance) await browserInstance.close().catch(() => {});
