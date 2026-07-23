@@ -475,17 +475,24 @@ async function runFollowList(req, res) {
       await route.fulfill({ response });
     });
 
-    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 60000 });
-    // Slow free instance: wait up to 45s for the first page, nudging the
-    // page with small scrolls in case the timeline loads lazily.
-    for (let i = 0; i < 90 && seen.size === 0; i += 1) {
+    // Render's proxy kills requests around 100s — everything (navigation,
+    // first capture, scrolling) must fit inside a hard budget and return
+    // whatever was captured by then. Callers doing two scrapes in one edge
+    // invocation pass a smaller budget to fit their own wall clock.
+    const BUDGET_MS = Math.max(30000, Math.min(70000, Number(req.body?.budget_ms) || 70000));
+    const elapsed = () => Date.now() - startTime;
+
+    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // Slow free instance: wait for the first page while there's budget,
+    // nudging with small scrolls in case the timeline loads lazily.
+    for (let i = 0; seen.size === 0 && elapsed() < BUDGET_MS * 0.6; i += 1) {
       await page.waitForTimeout(500);
       if (i > 0 && i % 10 === 0) await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
     }
 
-    // Infinite-scroll for more pages until the target or no growth.
+    // Infinite-scroll for more pages until the target, no growth, or budget.
     let stale = 0;
-    while (seen.size > 0 && seen.size < target && stale < 3) {
+    while (seen.size > 0 && seen.size < target && stale < 3 && elapsed() < BUDGET_MS) {
       const before = seen.size;
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(1800);
