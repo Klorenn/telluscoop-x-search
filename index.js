@@ -143,12 +143,14 @@ app.post("/profile", (req, res) => {
   });
 });
 
-// DISABLED on the free instance: rendering X's follower-list SPA exhausts the
-// 512MB container, OOM-kills the process, and takes /profile and /search down
-// with it for minutes. Refuse immediately instead of launching a browser.
-// Re-enable runFollowList (below) only on a >=2GB instance.
-app.post("/follow-list", (_req, res) => {
-  res.status(503).json({ error: "El scrape de listas de seguidores está desactivado (la instancia gratis no lo aguanta). Cargá las listas a mano.", disabled: true });
+// LIGHT mode on the free instance: capture only the first page(s) with almost
+// no scrolling. Deep infinite-scroll (400 users) is what OOM-killed the 512MB
+// container; a ~50-user sample keeps memory low and still gives a usable list.
+app.post("/follow-list", (req, res) => {
+  enqueue(() => runFollowList(req, res)).catch((err) => {
+    console.error(`[${Date.now()}] Queue error:`, err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  });
 });
 
 async function runSearch(req, res) {
@@ -437,7 +439,9 @@ async function runFollowList(req, res) {
   try {
     const handle = String(req.body?.handle || "").replace(/^@/, "").trim();
     const list = req.body?.list === "following" ? "following" : "followers";
-    const target = Math.max(20, Math.min(400, Number(req.body?.count) || 200));
+    // Light cap: deep scroll is what OOMs the 512MB box. Sample the first
+    // pages only (~50) unless a bigger box explicitly asks for more.
+    const target = Math.max(20, Math.min(120, Number(req.body?.count) || 50));
     if (!handle) return res.status(400).json({ error: "Missing handle" });
 
     console.log(`[${Date.now()}] Follow list: @${handle}/${list} target=${target}`);
@@ -456,9 +460,11 @@ async function runFollowList(req, res) {
     if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
     await context.addCookies(cookies);
 
+    // Block everything the list doesn't need (also CSS + other XHR) to keep
+    // the memory footprint as low as possible on the free box.
     await context.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (type === "image" || type === "media" || type === "font") return route.abort();
+      if (type === "image" || type === "media" || type === "font" || type === "stylesheet") return route.abort();
       return route.continue();
     });
 
@@ -499,23 +505,25 @@ async function runFollowList(req, res) {
     // first capture, scrolling) must fit inside a hard budget and return
     // whatever was captured by then. Callers doing two scrapes in one edge
     // invocation pass a smaller budget to fit their own wall clock.
-    const BUDGET_MS = Math.max(30000, Math.min(70000, Number(req.body?.budget_ms) || 70000));
+    const BUDGET_MS = Math.max(25000, Math.min(50000, Number(req.body?.budget_ms) || 45000));
     const elapsed = () => Date.now() - startTime;
 
-    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 45000 });
-    // Slow free instance: wait for the first page while there's budget,
-    // nudging with small scrolls in case the timeline loads lazily.
-    for (let i = 0; seen.size === 0 && elapsed() < BUDGET_MS * 0.6; i += 1) {
+    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 40000 });
+    // Wait for the first page of results.
+    for (let i = 0; seen.size === 0 && elapsed() < BUDGET_MS * 0.7; i += 1) {
       await page.waitForTimeout(500);
       if (i > 0 && i % 10 === 0) await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
     }
 
-    // Infinite-scroll for more pages until the target, no growth, or budget.
+    // Light scroll: just a few pages up to the small cap. Capped scroll count
+    // (not full infinite-scroll) so DOM + XHR memory never blows up.
     let stale = 0;
-    while (seen.size > 0 && seen.size < target && stale < 3 && elapsed() < BUDGET_MS) {
+    let scrolls = 0;
+    while (seen.size > 0 && seen.size < target && stale < 2 && scrolls < 6 && elapsed() < BUDGET_MS) {
       const before = seen.size;
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1800);
+      await page.waitForTimeout(1500);
+      scrolls += 1;
       stale = seen.size === before ? stale + 1 : 0;
     }
 
