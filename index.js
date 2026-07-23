@@ -143,6 +143,13 @@ app.post("/profile", (req, res) => {
   });
 });
 
+app.post("/follow-list", (req, res) => {
+  enqueue(() => runFollowList(req, res)).catch((err) => {
+    console.error(`[${Date.now()}] Queue error:`, err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  });
+});
+
 async function runSearch(req, res) {
   const startTime = Date.now();
   let browserInstance = null;
@@ -380,6 +387,111 @@ async function runProfile(req, res) {
     res.json({ followers, latest_post: latestTweet });
   } catch (err) {
     console.error(`[${Date.now()}] Profile error:`, err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  } finally {
+    if (browserInstance) await browserInstance.close().catch(() => {});
+  }
+}
+
+// Followers/Following timelines share the entry shape: "user-…" entries with
+// a user_results payload.
+function parseUserList(data) {
+  const users = [];
+  const instructions =
+    data?.data?.user?.result?.timeline?.timeline?.instructions ??
+    data?.data?.user?.result?.timeline_v2?.timeline?.instructions ?? [];
+  for (const instruction of instructions) {
+    for (const entry of instruction.entries ?? []) {
+      if (!String(entry.entryId ?? "").startsWith("user-")) continue;
+      const result = entry.content?.itemContent?.user_results?.result;
+      if (!result) continue;
+      const legacy = result.legacy ?? {};
+      const core = result.core ?? {};
+      const handle = legacy.screen_name ?? core.screen_name ?? "";
+      if (!handle) continue;
+      users.push({
+        handle,
+        name: legacy.name ?? core.name ?? "",
+        bio: String(legacy.description ?? "").slice(0, 200),
+        followers: num(legacy.followers_count ?? result?.relationship_counts?.followers),
+        url: `https://x.com/${handle}`,
+      });
+    }
+  }
+  return users;
+}
+
+async function runFollowList(req, res) {
+  const startTime = Date.now();
+  let browserInstance = null;
+  try {
+    const handle = String(req.body?.handle || "").replace(/^@/, "").trim();
+    const list = req.body?.list === "following" ? "following" : "followers";
+    const target = Math.max(20, Math.min(400, Number(req.body?.count) || 200));
+    if (!handle) return res.status(400).json({ error: "Missing handle" });
+
+    console.log(`[${Date.now()}] Follow list: @${handle}/${list} target=${target}`);
+
+    browserInstance = await launchBrowser();
+    const context = await browserInstance.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    });
+
+    const cookies = [
+      { name: "auth_token", value: AUTH_TOKEN, domain: ".x.com", path: "/" },
+      { name: "ct0", value: CT0, domain: ".x.com", path: "/" },
+    ];
+    if (TWID) cookies.push({ name: "twid", value: TWID, domain: ".x.com", path: "/" });
+    if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
+    await context.addCookies(cookies);
+
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "image" || type === "media" || type === "font") return route.abort();
+      return route.continue();
+    });
+
+    const page = await context.newPage();
+
+    // Accumulate users across every intercepted page of the list. The
+    // pattern matches Followers, BlueVerifiedFollowers and Following.
+    const seen = new Map();
+    const graphqlName = list === "following" ? "Following" : "Followers";
+    await page.route(`**/api/graphql/**/*${graphqlName}*`, async (route) => {
+      const response = await route.fetch();
+      if (response.status() === 200) {
+        try {
+          for (const user of parseUserList(await response.json())) seen.set(user.handle, user);
+        } catch { /* ignore */ }
+      }
+      await route.fulfill({ response });
+    });
+
+    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 60000 });
+    for (let i = 0; i < 40 && seen.size === 0; i += 1) await page.waitForTimeout(500);
+
+    // Infinite-scroll for more pages until the target or no growth.
+    let stale = 0;
+    while (seen.size > 0 && seen.size < target && stale < 3) {
+      const before = seen.size;
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1800);
+      stale = seen.size === before ? stale + 1 : 0;
+    }
+
+    if (!seen.size) {
+      return res.status(502).json({
+        error: "No se pudo leer la lista",
+        diag: { url: page.url(), title: await page.title().catch(() => "") },
+      });
+    }
+
+    const users = [...seen.values()];
+    console.log(`[${Date.now()}] @${handle}/${list}: ${users.length} users in ${Date.now() - startTime}ms`);
+    res.json({ users, count: users.length, list });
+  } catch (err) {
+    console.error(`[${Date.now()}] Follow list error:`, err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
   } finally {
     if (browserInstance) await browserInstance.close().catch(() => {});
