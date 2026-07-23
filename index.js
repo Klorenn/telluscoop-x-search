@@ -454,11 +454,18 @@ async function runFollowList(req, res) {
 
     const page = await context.newPage();
 
-    // Accumulate users across every intercepted page of the list. The
-    // pattern matches Followers, BlueVerifiedFollowers and Following.
+    // Accumulate users across every intercepted page of the list. Intercept
+    // ALL graphql calls and match the operation name loosely ("followers"
+    // also catches BlueVerifiedFollowers); the exact-glob approach missed
+    // renamed operations. Op names are collected for remote diagnosis since
+    // Render logs are hard to reach.
     const seen = new Map();
-    const graphqlName = list === "following" ? "Following" : "Followers";
-    await page.route(`**/api/graphql/**/*${graphqlName}*`, async (route) => {
+    const opsSeen = new Set();
+    const wanted = list === "following" ? "following" : "followers";
+    await page.route("**/i/api/graphql/**", async (route) => {
+      const op = route.request().url().match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
+      opsSeen.add(op);
+      if (!op.toLowerCase().includes(wanted)) return route.continue();
       const response = await route.fetch();
       if (response.status() === 200) {
         try {
@@ -469,7 +476,12 @@ async function runFollowList(req, res) {
     });
 
     await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 60000 });
-    for (let i = 0; i < 40 && seen.size === 0; i += 1) await page.waitForTimeout(500);
+    // Slow free instance: wait up to 45s for the first page, nudging the
+    // page with small scrolls in case the timeline loads lazily.
+    for (let i = 0; i < 90 && seen.size === 0; i += 1) {
+      await page.waitForTimeout(500);
+      if (i > 0 && i % 10 === 0) await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
+    }
 
     // Infinite-scroll for more pages until the target or no growth.
     let stale = 0;
@@ -483,7 +495,11 @@ async function runFollowList(req, res) {
     if (!seen.size) {
       return res.status(502).json({
         error: "No se pudo leer la lista",
-        diag: { url: page.url(), title: await page.title().catch(() => "") },
+        diag: {
+          url: page.url(),
+          title: await page.title().catch(() => ""),
+          graphql_ops: [...opsSeen].slice(0, 25),
+        },
       });
     }
 
