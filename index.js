@@ -518,9 +518,19 @@ async function runFollowList(req, res) {
       stale = seen.size === before ? stale + 1 : 0;
     }
 
-    if (!seen.size) {
-      return res.status(502).json({
-        error: "No se pudo leer la lista",
+    // The free instance can't always load X's heavy follower page in time.
+    // Return whatever was captured as a 200 (partial is fine); only when
+    // literally nothing loaded do we send an empty list with a soft note so
+    // the UI can say "reintentá" instead of showing a hard error.
+    const users = [...seen.values()];
+    console.log(`[${Date.now()}] @${handle}/${list}: ${users.length} users in ${Date.now() - startTime}ms`);
+    if (!users.length) {
+      return res.json({
+        users: [],
+        count: 0,
+        list,
+        partial: true,
+        note: "X no alcanzó a cargar la lista esta vez. Reintentá en un momento.",
         diag: {
           url: page.url(),
           title: await page.title().catch(() => ""),
@@ -530,10 +540,7 @@ async function runFollowList(req, res) {
         },
       });
     }
-
-    const users = [...seen.values()];
-    console.log(`[${Date.now()}] @${handle}/${list}: ${users.length} users in ${Date.now() - startTime}ms`);
-    res.json({ users, count: users.length, list });
+    res.json({ users, count: users.length, list, partial: users.length < target });
   } catch (err) {
     console.error(`[${Date.now()}] Follow list error:`, err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
