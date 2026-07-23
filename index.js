@@ -393,29 +393,38 @@ async function runProfile(req, res) {
   }
 }
 
-// Followers/Following timelines share the entry shape: "user-…" entries with
-// a user_results payload.
+// Followers/Following timelines: "user-…" entries (or module items) carrying
+// a user_results payload. X keeps migrating field homes (legacy → core →
+// relationship_counts), so every known location is tried.
 function parseUserList(data) {
   const users = [];
-  const instructions =
-    data?.data?.user?.result?.timeline?.timeline?.instructions ??
-    data?.data?.user?.result?.timeline_v2?.timeline?.instructions ?? [];
-  for (const instruction of instructions) {
-    for (const entry of instruction.entries ?? []) {
-      if (!String(entry.entryId ?? "").startsWith("user-")) continue;
-      const result = entry.content?.itemContent?.user_results?.result;
-      if (!result) continue;
-      const legacy = result.legacy ?? {};
-      const core = result.core ?? {};
-      const handle = legacy.screen_name ?? core.screen_name ?? "";
-      if (!handle) continue;
-      users.push({
-        handle,
-        name: legacy.name ?? core.name ?? "",
-        bio: String(legacy.description ?? "").slice(0, 200),
-        followers: num(legacy.followers_count ?? result?.relationship_counts?.followers),
-        url: `https://x.com/${handle}`,
-      });
+  const pushUser = (itemContent) => {
+    const result = itemContent?.user_results?.result ?? itemContent?.userResults?.result;
+    if (!result) return;
+    const legacy = result.legacy ?? {};
+    const core = result.core ?? {};
+    const handle = legacy.screen_name ?? core.screen_name ?? "";
+    if (!handle) return;
+    users.push({
+      handle,
+      name: legacy.name ?? core.name ?? "",
+      bio: String(legacy.description ?? result.profile_bio?.description ?? "").slice(0, 200),
+      followers: num(legacy.followers_count ?? result.relationship_counts?.followers),
+      url: `https://x.com/${handle}`,
+    });
+  };
+  const timelines = [
+    data?.data?.user?.result?.timeline?.timeline,
+    data?.data?.user?.result?.timeline_v2?.timeline,
+  ];
+  for (const timeline of timelines) {
+    for (const instruction of timeline?.instructions ?? []) {
+      for (const entry of instruction.entries ?? []) {
+        pushUser(entry.content?.itemContent);
+        for (const item of entry.content?.items ?? []) pushUser(item.item?.itemContent);
+      }
+      // Some instructions carry a single entry instead of a list.
+      if (instruction.entry) pushUser(instruction.entry.content?.itemContent);
     }
   }
   return users;
@@ -454,25 +463,33 @@ async function runFollowList(req, res) {
 
     const page = await context.newPage();
 
-    // Accumulate users across every intercepted page of the list. Intercept
-    // ALL graphql calls and match the operation name loosely ("followers"
-    // also catches BlueVerifiedFollowers); the exact-glob approach missed
-    // renamed operations. Op names are collected for remote diagnosis since
-    // Render logs are hard to reach.
+    // Accumulate users from every list-timeline response. A passive
+    // response listener reads the SAME body the page received — re-fetching
+    // via route.fetch() duplicated the request and X answered the copy
+    // differently. Loose op-name match ("followers" also catches
+    // BlueVerifiedFollowers); ops/statuses/payload preview are collected for
+    // remote diagnosis since Render logs are hard to reach.
     const seen = new Map();
     const opsSeen = new Set();
+    const opStatuses = [];
+    let payloadPreview = "";
     const wanted = list === "following" ? "following" : "followers";
-    await page.route("**/i/api/graphql/**", async (route) => {
-      const op = route.request().url().match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
+    page.on("response", async (response) => {
+      const url = response.url();
+      if (!url.includes("/i/api/graphql/")) return;
+      const op = url.match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
       opsSeen.add(op);
-      if (!op.toLowerCase().includes(wanted)) return route.continue();
-      const response = await route.fetch();
-      if (response.status() === 200) {
-        try {
-          for (const user of parseUserList(await response.json())) seen.set(user.handle, user);
-        } catch { /* ignore */ }
+      if (!op.toLowerCase().includes(wanted)) return;
+      opStatuses.push(`${op}:${response.status()}`);
+      if (response.status() !== 200) return;
+      try {
+        const payload = await response.json();
+        const users = parseUserList(payload);
+        if (!users.length && !payloadPreview) payloadPreview = JSON.stringify(payload).slice(0, 500);
+        for (const user of users) seen.set(user.handle, user);
+      } catch (e) {
+        opStatuses.push(`${op}:parse-error ${e.message.slice(0, 80)}`);
       }
-      await route.fulfill({ response });
     });
 
     // Render's proxy kills requests around 100s — everything (navigation,
@@ -506,6 +523,8 @@ async function runFollowList(req, res) {
           url: page.url(),
           title: await page.title().catch(() => ""),
           graphql_ops: [...opsSeen].slice(0, 25),
+          matched: opStatuses.slice(0, 10),
+          payload_preview: payloadPreview,
         },
       });
     }
