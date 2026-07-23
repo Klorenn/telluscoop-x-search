@@ -463,33 +463,34 @@ async function runFollowList(req, res) {
 
     const page = await context.newPage();
 
-    // Accumulate users from every list-timeline response. A passive
-    // response listener reads the SAME body the page received — re-fetching
-    // via route.fetch() duplicated the request and X answered the copy
-    // differently. Loose op-name match ("followers" also catches
-    // BlueVerifiedFollowers); ops/statuses/payload preview are collected for
+    // Accumulate users by intercepting the list-timeline graphql calls. Route
+    // interception (fetch + fulfill) reads the body reliably — a passive
+    // page.on("response") listener could not read the body of these responses
+    // and hung. Loose op-name match ("followers" also catches
+    // BlueVerifiedFollowers). ops/statuses/payload preview collected for
     // remote diagnosis since Render logs are hard to reach.
     const seen = new Map();
     const opsSeen = new Set();
     const opStatuses = [];
     let payloadPreview = "";
     const wanted = list === "following" ? "following" : "followers";
-    page.on("response", async (response) => {
-      const url = response.url();
-      if (!url.includes("/i/api/graphql/")) return;
-      const op = url.match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
+    await page.route("**/i/api/graphql/**", async (route) => {
+      const op = route.request().url().match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
       opsSeen.add(op);
-      if (!op.toLowerCase().includes(wanted)) return;
+      if (!op.toLowerCase().includes(wanted)) return route.continue();
+      const response = await route.fetch();
       opStatuses.push(`${op}:${response.status()}`);
-      if (response.status() !== 200) return;
-      try {
-        const payload = await response.json();
-        const users = parseUserList(payload);
-        if (!users.length && !payloadPreview) payloadPreview = JSON.stringify(payload).slice(0, 500);
-        for (const user of users) seen.set(user.handle, user);
-      } catch (e) {
-        opStatuses.push(`${op}:parse-error ${e.message.slice(0, 80)}`);
+      if (response.status() === 200) {
+        try {
+          const payload = await response.json();
+          const users = parseUserList(payload);
+          if (!users.length && !payloadPreview) payloadPreview = JSON.stringify(payload).slice(0, 500);
+          for (const user of users) seen.set(user.handle, user);
+        } catch (e) {
+          opStatuses.push(`${op}:parse-error ${e.message.slice(0, 80)}`);
+        }
       }
+      await route.fulfill({ response });
     });
 
     // Render's proxy kills requests around 100s — everything (navigation,
