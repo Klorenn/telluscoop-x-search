@@ -143,11 +143,12 @@ app.post("/profile", (req, res) => {
   });
 });
 
-app.post("/follow-list", (req, res) => {
-  enqueue(() => runFollowList(req, res)).catch((err) => {
-    console.error(`[${Date.now()}] Queue error:`, err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  });
+// DISABLED on the free instance: rendering X's follower-list SPA exhausts the
+// 512MB container, OOM-kills the process, and takes /profile and /search down
+// with it for minutes. Refuse immediately instead of launching a browser.
+// Re-enable runFollowList (below) only on a >=2GB instance.
+app.post("/follow-list", (_req, res) => {
+  res.status(503).json({ error: "El scrape de listas de seguidores está desactivado (la instancia gratis no lo aguanta). Cargá las listas a mano.", disabled: true });
 });
 
 async function runSearch(req, res) {
