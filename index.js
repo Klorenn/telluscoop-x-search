@@ -470,34 +470,33 @@ async function runFollowList(req, res) {
 
     const page = await context.newPage();
 
-    // Read the list-timeline responses the page actually received, via
-    // requestfinished → request.response() → response.body(). This does NOT
-    // re-issue the request (route.fetch got a different/empty answer from X)
-    // and does NOT hang like response.json() in a passive response listener.
-    // Loose op-name match ("followers" also catches BlueVerifiedFollowers).
-    // Rich diagnostics are collected because Render logs are hard to reach.
+    // Intercept the list-timeline graphql calls and read the body via
+    // route.fetch()+fulfill (this is the version that returned real users for
+    // telluscoop/following). Loose op-name match ("followers" also catches
+    // BlueVerifiedFollowers). Diagnostics collected since Render logs are hard
+    // to reach.
     const seen = new Map();
     const opsSeen = new Set();
     const opStatuses = [];
     let payloadPreview = "";
     const wanted = list === "following" ? "following" : "followers";
-    page.on("requestfinished", async (request) => {
-      const url = request.url();
-      if (!url.includes("/i/api/graphql/")) return;
-      const op = url.match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
+    await page.route("**/i/api/graphql/**", async (route) => {
+      const op = route.request().url().match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
       opsSeen.add(op);
-      if (!op.toLowerCase().includes(wanted)) return;
+      if (!op.toLowerCase().includes(wanted)) return route.continue();
       try {
-        const response = await request.response();
-        if (!response) { opStatuses.push(`${op}:no-response`); return; }
-        const body = await response.body();
-        opStatuses.push(`${op}:${response.status()}:${body.length}b`);
-        const payload = JSON.parse(body.toString("utf8"));
-        const users = parseUserList(payload);
-        if (!users.length && !payloadPreview) payloadPreview = JSON.stringify(payload).slice(0, 600);
-        for (const user of users) seen.set(user.handle, user);
+        const response = await route.fetch();
+        opStatuses.push(`${op}:${response.status()}`);
+        if (response.status() === 200) {
+          const payload = await response.json();
+          const users = parseUserList(payload);
+          if (!users.length && !payloadPreview) payloadPreview = JSON.stringify(payload).slice(0, 600);
+          for (const user of users) seen.set(user.handle, user);
+        }
+        await route.fulfill({ response });
       } catch (e) {
         opStatuses.push(`${op}:err ${String(e.message || e).slice(0, 90)}`);
+        await route.continue().catch(() => {});
       }
     });
 
