@@ -33,12 +33,17 @@ async function launchBrowser() {
       "--mute-audio",
       "--disable-background-networking",
       "--renderer-process-limit=2",
-      // Tuned for the Render Starter plan (2GB). On free (512MB) lower this
-      // back to 192 or the follower-list scrape OOM-kills the container.
-      `--js-flags=--max-old-space-size=${process.env.V8_HEAP_MB || 512}`,
+      // Safe default (192) for the 512MB free box. Set V8_HEAP_MB=512 after
+      // upgrading to the 2GB Starter plan to allow bigger follower scrapes.
+      `--js-flags=--max-old-space-size=${process.env.V8_HEAP_MB || 192}`,
     ],
   });
 }
+
+// Follower-list scraping adapts to the box: only go aggressive (big cap, long
+// budget, keep CSS) when V8_HEAP_MB says there's 2GB. Default is the light
+// mode that survives on the 512MB free instance.
+const BIG_BOX = Number(process.env.V8_HEAP_MB || 192) >= 400;
 
 let queue = Promise.resolve();
 function enqueue(job) {
@@ -441,9 +446,10 @@ async function runFollowList(req, res) {
   try {
     const handle = String(req.body?.handle || "").replace(/^@/, "").trim();
     const list = req.body?.list === "following" ? "following" : "followers";
-    // Tuned for the 2GB Starter plan: pull a real page of results. On free
-    // (512MB) cap this low (~50) via the caller's count or it OOMs.
-    const target = Math.max(20, Math.min(600, Number(req.body?.count) || 300));
+    // Cap adapts to the box: ~50 on free (deep scroll OOMs 512MB), up to 600
+    // on 2GB. The caller's count is clamped to whatever this box can take.
+    const maxCap = BIG_BOX ? 600 : 60;
+    const target = Math.max(20, Math.min(maxCap, Number(req.body?.count) || (BIG_BOX ? 300 : 50)));
     if (!handle) return res.status(400).json({ error: "Missing handle" });
 
     console.log(`[${Date.now()}] Follow list: @${handle}/${list} target=${target}`);
@@ -462,11 +468,12 @@ async function runFollowList(req, res) {
     if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
     await context.addCookies(cookies);
 
-    // Drop heavy assets the list doesn't need. CSS is left on for the 2GB
-    // plan (helps the SPA render reliably); on free, also abort stylesheet.
+    // Drop heavy assets. On the free box also abort CSS to save memory; on
+    // 2GB keep CSS so the SPA renders reliably.
     await context.route("**/*", (route) => {
       const type = route.request().resourceType();
       if (type === "image" || type === "media" || type === "font") return route.abort();
+      if (!BIG_BOX && type === "stylesheet") return route.abort();
       return route.continue();
     });
 
@@ -506,8 +513,11 @@ async function runFollowList(req, res) {
     // first capture, scrolling) must fit inside a hard budget and return
     // whatever was captured by then. Callers doing two scrapes in one edge
     // invocation pass a smaller budget to fit their own wall clock.
-    // Render's proxy kills requests near 100s, so cap the budget under that.
-    const BUDGET_MS = Math.max(25000, Math.min(85000, Number(req.body?.budget_ms) || 80000));
+    // Budget under Render's ~100s proxy kill. Shorter + fewer scrolls on the
+    // free box to keep memory low; longer on 2GB for a fuller list.
+    const maxBudget = BIG_BOX ? 85000 : 45000;
+    const maxScrolls = BIG_BOX ? 40 : 6;
+    const BUDGET_MS = Math.max(25000, Math.min(maxBudget, Number(req.body?.budget_ms) || maxBudget));
     const elapsed = () => Date.now() - startTime;
 
     await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -517,11 +527,11 @@ async function runFollowList(req, res) {
       if (i > 0 && i % 10 === 0) await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
     }
 
-    // Infinite-scroll toward the target. 2GB handles the DOM growth; the
-    // budget and stale checks stop it before Render's proxy timeout.
+    // Scroll toward the target, bounded by budget and scroll cap so DOM/XHR
+    // memory never blows past what the box can hold.
     let stale = 0;
     let scrolls = 0;
-    while (seen.size > 0 && seen.size < target && stale < 3 && scrolls < 40 && elapsed() < BUDGET_MS) {
+    while (seen.size > 0 && seen.size < target && stale < 3 && scrolls < maxScrolls && elapsed() < BUDGET_MS) {
       const before = seen.size;
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(1500);

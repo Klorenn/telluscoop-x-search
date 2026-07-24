@@ -1,12 +1,14 @@
-# Follower-list scraping is tuned for the Starter plan (2GB): the follower
-# SPA OOM-kills a 512MB free instance. Set plan: starter in the Render
-# dashboard. If you must stay on free, also set V8_HEAP_MB=192 and drop the
-# scrape count (the follower-list endpoint will be flaky either way).
+# The server adapts to the box automatically. On the free plan it runs light
+# follower scrapes (small cap) that survive 512MB. To get FULL, reliable
+# follower-list scraping: upgrade this service to the Starter plan (2GB) in the
+# Render dashboard AND set V8_HEAP_MB=512 — the code then switches to the
+# aggressive path (bigger cap, longer budget, CSS kept). Leave V8_HEAP_MB unset
+# (or 192) while on free.
 services:
   - type: web
     name: x-search
     runtime: docker
-    plan: starter
+    plan: free
     envVars:
       - key: X_AUTH_TOKEN
         sync: false
@@ -16,6 +18,6 @@ services:
         sync: false
       - key: X_TWID
         sync: false
-      # Chromium V8 heap (MB). 512 on Starter/2GB; drop to 192 on free/512MB.
+      # Set to 512 ONLY after upgrading to Starter (2GB). Unset/192 on free.
       - key: V8_HEAP_MB
-        value: "512"
+        sync: false
