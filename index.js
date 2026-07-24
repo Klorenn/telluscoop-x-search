@@ -33,17 +33,10 @@ async function launchBrowser() {
       "--mute-audio",
       "--disable-background-networking",
       "--renderer-process-limit=2",
-      // Safe default (192) for the 512MB free box. Set V8_HEAP_MB=512 after
-      // upgrading to the 2GB Starter plan to allow bigger follower scrapes.
-      `--js-flags=--max-old-space-size=${process.env.V8_HEAP_MB || 192}`,
+      "--js-flags=--max-old-space-size=192",
     ],
   });
 }
-
-// Follower-list scraping adapts to the box: only go aggressive (big cap, long
-// budget, keep CSS) when V8_HEAP_MB says there's 2GB. Default is the light
-// mode that survives on the 512MB free instance.
-const BIG_BOX = Number(process.env.V8_HEAP_MB || 192) >= 400;
 
 let queue = Promise.resolve();
 function enqueue(job) {
@@ -150,9 +143,6 @@ app.post("/profile", (req, res) => {
   });
 });
 
-// LIGHT mode on the free instance: capture only the first page(s) with almost
-// no scrolling. Deep infinite-scroll (400 users) is what OOM-killed the 512MB
-// container; a ~50-user sample keeps memory low and still gives a usable list.
 app.post("/follow-list", (req, res) => {
   enqueue(() => runFollowList(req, res)).catch((err) => {
     console.error(`[${Date.now()}] Queue error:`, err.message);
@@ -403,38 +393,29 @@ async function runProfile(req, res) {
   }
 }
 
-// Followers/Following timelines: "user-…" entries (or module items) carrying
-// a user_results payload. X keeps migrating field homes (legacy → core →
-// relationship_counts), so every known location is tried.
+// Followers/Following timelines share the entry shape: "user-…" entries with
+// a user_results payload.
 function parseUserList(data) {
   const users = [];
-  const pushUser = (itemContent) => {
-    const result = itemContent?.user_results?.result ?? itemContent?.userResults?.result;
-    if (!result) return;
-    const legacy = result.legacy ?? {};
-    const core = result.core ?? {};
-    const handle = legacy.screen_name ?? core.screen_name ?? "";
-    if (!handle) return;
-    users.push({
-      handle,
-      name: legacy.name ?? core.name ?? "",
-      bio: String(legacy.description ?? result.profile_bio?.description ?? "").slice(0, 200),
-      followers: num(legacy.followers_count ?? result.relationship_counts?.followers),
-      url: `https://x.com/${handle}`,
-    });
-  };
-  const timelines = [
-    data?.data?.user?.result?.timeline?.timeline,
-    data?.data?.user?.result?.timeline_v2?.timeline,
-  ];
-  for (const timeline of timelines) {
-    for (const instruction of timeline?.instructions ?? []) {
-      for (const entry of instruction.entries ?? []) {
-        pushUser(entry.content?.itemContent);
-        for (const item of entry.content?.items ?? []) pushUser(item.item?.itemContent);
-      }
-      // Some instructions carry a single entry instead of a list.
-      if (instruction.entry) pushUser(instruction.entry.content?.itemContent);
+  const instructions =
+    data?.data?.user?.result?.timeline?.timeline?.instructions ??
+    data?.data?.user?.result?.timeline_v2?.timeline?.instructions ?? [];
+  for (const instruction of instructions) {
+    for (const entry of instruction.entries ?? []) {
+      if (!String(entry.entryId ?? "").startsWith("user-")) continue;
+      const result = entry.content?.itemContent?.user_results?.result;
+      if (!result) continue;
+      const legacy = result.legacy ?? {};
+      const core = result.core ?? {};
+      const handle = legacy.screen_name ?? core.screen_name ?? "";
+      if (!handle) continue;
+      users.push({
+        handle,
+        name: legacy.name ?? core.name ?? "",
+        bio: String(legacy.description ?? "").slice(0, 200),
+        followers: num(legacy.followers_count ?? result?.relationship_counts?.followers),
+        url: `https://x.com/${handle}`,
+      });
     }
   }
   return users;
@@ -446,10 +427,7 @@ async function runFollowList(req, res) {
   try {
     const handle = String(req.body?.handle || "").replace(/^@/, "").trim();
     const list = req.body?.list === "following" ? "following" : "followers";
-    // Cap adapts to the box: ~50 on free (deep scroll OOMs 512MB), up to 600
-    // on 2GB. The caller's count is clamped to whatever this box can take.
-    const maxCap = BIG_BOX ? 600 : 60;
-    const target = Math.max(20, Math.min(maxCap, Number(req.body?.count) || (BIG_BOX ? 300 : 50)));
+    const target = Math.max(20, Math.min(400, Number(req.body?.count) || 200));
     if (!handle) return res.status(400).json({ error: "Missing handle" });
 
     console.log(`[${Date.now()}] Follow list: @${handle}/${list} target=${target}`);
@@ -468,100 +446,50 @@ async function runFollowList(req, res) {
     if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
     await context.addCookies(cookies);
 
-    // Drop heavy assets. On the free box also abort CSS to save memory; on
-    // 2GB keep CSS so the SPA renders reliably.
     await context.route("**/*", (route) => {
       const type = route.request().resourceType();
       if (type === "image" || type === "media" || type === "font") return route.abort();
-      if (!BIG_BOX && type === "stylesheet") return route.abort();
       return route.continue();
     });
 
     const page = await context.newPage();
 
-    // Intercept the list-timeline graphql calls and read the body via
-    // route.fetch()+fulfill (this is the version that returned real users for
-    // telluscoop/following). Loose op-name match ("followers" also catches
-    // BlueVerifiedFollowers). Diagnostics collected since Render logs are hard
-    // to reach.
+    // Accumulate users across every intercepted page of the list. The
+    // pattern matches Followers, BlueVerifiedFollowers and Following.
     const seen = new Map();
-    const opsSeen = new Set();
-    const opStatuses = [];
-    let payloadPreview = "";
-    const wanted = list === "following" ? "following" : "followers";
-    await page.route("**/i/api/graphql/**", async (route) => {
-      const op = route.request().url().match(/graphql\/[^/]+\/([^/?]+)/)?.[1] ?? "";
-      opsSeen.add(op);
-      if (!op.toLowerCase().includes(wanted)) return route.continue();
-      try {
-        const response = await route.fetch();
-        opStatuses.push(`${op}:${response.status()}`);
-        if (response.status() === 200) {
-          const payload = await response.json();
-          const users = parseUserList(payload);
-          if (!users.length && !payloadPreview) payloadPreview = JSON.stringify(payload).slice(0, 600);
-          for (const user of users) seen.set(user.handle, user);
-        }
-        await route.fulfill({ response });
-      } catch (e) {
-        opStatuses.push(`${op}:err ${String(e.message || e).slice(0, 90)}`);
-        await route.continue().catch(() => {});
+    const graphqlName = list === "following" ? "Following" : "Followers";
+    await page.route(`**/api/graphql/**/*${graphqlName}*`, async (route) => {
+      const response = await route.fetch();
+      if (response.status() === 200) {
+        try {
+          for (const user of parseUserList(await response.json())) seen.set(user.handle, user);
+        } catch { /* ignore */ }
       }
+      await route.fulfill({ response });
     });
 
-    // Render's proxy kills requests around 100s — everything (navigation,
-    // first capture, scrolling) must fit inside a hard budget and return
-    // whatever was captured by then. Callers doing two scrapes in one edge
-    // invocation pass a smaller budget to fit their own wall clock.
-    // Budget under Render's ~100s proxy kill. Shorter + fewer scrolls on the
-    // free box to keep memory low; longer on 2GB for a fuller list.
-    const maxBudget = BIG_BOX ? 85000 : 45000;
-    const maxScrolls = BIG_BOX ? 40 : 6;
-    const BUDGET_MS = Math.max(25000, Math.min(maxBudget, Number(req.body?.budget_ms) || maxBudget));
-    const elapsed = () => Date.now() - startTime;
+    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 60000 });
+    for (let i = 0; i < 40 && seen.size === 0; i += 1) await page.waitForTimeout(500);
 
-    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 45000 });
-    // Wait for the first page of results.
-    for (let i = 0; seen.size === 0 && elapsed() < BUDGET_MS * 0.6; i += 1) {
-      await page.waitForTimeout(500);
-      if (i > 0 && i % 10 === 0) await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
-    }
-
-    // Scroll toward the target, bounded by budget and scroll cap so DOM/XHR
-    // memory never blows past what the box can hold.
+    // Infinite-scroll for more pages until the target or no growth.
     let stale = 0;
-    let scrolls = 0;
-    while (seen.size > 0 && seen.size < target && stale < 3 && scrolls < maxScrolls && elapsed() < BUDGET_MS) {
+    while (seen.size > 0 && seen.size < target && stale < 3) {
       const before = seen.size;
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1500);
-      scrolls += 1;
+      await page.waitForTimeout(1800);
       stale = seen.size === before ? stale + 1 : 0;
     }
 
-    // The free instance can't always load X's heavy follower page in time.
-    // Return whatever was captured as a 200 (partial is fine); only when
-    // literally nothing loaded do we send an empty list with a soft note so
-    // the UI can say "reintentá" instead of showing a hard error.
-    const users = [...seen.values()];
-    console.log(`[${Date.now()}] @${handle}/${list}: ${users.length} users in ${Date.now() - startTime}ms`);
-    if (!users.length) {
-      return res.json({
-        users: [],
-        count: 0,
-        list,
-        partial: true,
-        note: "X no alcanzó a cargar la lista esta vez. Reintentá en un momento.",
-        diag: {
-          url: page.url(),
-          title: await page.title().catch(() => ""),
-          graphql_ops: [...opsSeen].slice(0, 25),
-          matched: opStatuses.slice(0, 10),
-          payload_preview: payloadPreview,
-        },
+    if (!seen.size) {
+      return res.status(502).json({
+        error: "No se pudo leer la lista",
+        diag: { url: page.url(), title: await page.title().catch(() => "") },
       });
     }
-    res.json({ users, count: users.length, list, partial: users.length < target });
+
+    const users = [...seen.values()];
+    console.log(`[${Date.now()}] @${handle}/${list}: ${users.length} users in ${Date.now() - startTime}ms`);
+    res.json({ users, count: users.length, list });
   } catch (err) {
     console.error(`[${Date.now()}] Follow list error:`, err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
