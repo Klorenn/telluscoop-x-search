@@ -33,7 +33,9 @@ async function launchBrowser() {
       "--mute-audio",
       "--disable-background-networking",
       "--renderer-process-limit=2",
-      "--js-flags=--max-old-space-size=192",
+      // Tuned for the Render Starter plan (2GB). On free (512MB) lower this
+      // back to 192 or the follower-list scrape OOM-kills the container.
+      `--js-flags=--max-old-space-size=${process.env.V8_HEAP_MB || 512}`,
     ],
   });
 }
@@ -439,9 +441,9 @@ async function runFollowList(req, res) {
   try {
     const handle = String(req.body?.handle || "").replace(/^@/, "").trim();
     const list = req.body?.list === "following" ? "following" : "followers";
-    // Light cap: deep scroll is what OOMs the 512MB box. Sample the first
-    // pages only (~50) unless a bigger box explicitly asks for more.
-    const target = Math.max(20, Math.min(120, Number(req.body?.count) || 50));
+    // Tuned for the 2GB Starter plan: pull a real page of results. On free
+    // (512MB) cap this low (~50) via the caller's count or it OOMs.
+    const target = Math.max(20, Math.min(600, Number(req.body?.count) || 300));
     if (!handle) return res.status(400).json({ error: "Missing handle" });
 
     console.log(`[${Date.now()}] Follow list: @${handle}/${list} target=${target}`);
@@ -460,11 +462,11 @@ async function runFollowList(req, res) {
     if (AUTH_MULTI) cookies.push({ name: "auth_multi", value: AUTH_MULTI, domain: ".x.com", path: "/" });
     await context.addCookies(cookies);
 
-    // Block everything the list doesn't need (also CSS + other XHR) to keep
-    // the memory footprint as low as possible on the free box.
+    // Drop heavy assets the list doesn't need. CSS is left on for the 2GB
+    // plan (helps the SPA render reliably); on free, also abort stylesheet.
     await context.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (type === "image" || type === "media" || type === "font" || type === "stylesheet") return route.abort();
+      if (type === "image" || type === "media" || type === "font") return route.abort();
       return route.continue();
     });
 
@@ -504,21 +506,22 @@ async function runFollowList(req, res) {
     // first capture, scrolling) must fit inside a hard budget and return
     // whatever was captured by then. Callers doing two scrapes in one edge
     // invocation pass a smaller budget to fit their own wall clock.
-    const BUDGET_MS = Math.max(25000, Math.min(50000, Number(req.body?.budget_ms) || 45000));
+    // Render's proxy kills requests near 100s, so cap the budget under that.
+    const BUDGET_MS = Math.max(25000, Math.min(85000, Number(req.body?.budget_ms) || 80000));
     const elapsed = () => Date.now() - startTime;
 
-    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 40000 });
+    await page.goto(`https://x.com/${handle}/${list}`, { waitUntil: "domcontentloaded", timeout: 45000 });
     // Wait for the first page of results.
-    for (let i = 0; seen.size === 0 && elapsed() < BUDGET_MS * 0.7; i += 1) {
+    for (let i = 0; seen.size === 0 && elapsed() < BUDGET_MS * 0.6; i += 1) {
       await page.waitForTimeout(500);
       if (i > 0 && i % 10 === 0) await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
     }
 
-    // Light scroll: just a few pages up to the small cap. Capped scroll count
-    // (not full infinite-scroll) so DOM + XHR memory never blows up.
+    // Infinite-scroll toward the target. 2GB handles the DOM growth; the
+    // budget and stale checks stop it before Render's proxy timeout.
     let stale = 0;
     let scrolls = 0;
-    while (seen.size > 0 && seen.size < target && stale < 2 && scrolls < 6 && elapsed() < BUDGET_MS) {
+    while (seen.size > 0 && seen.size < target && stale < 3 && scrolls < 40 && elapsed() < BUDGET_MS) {
       const before = seen.size;
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(1500);
